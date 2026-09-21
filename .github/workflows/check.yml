@@ -1,15 +1,13 @@
 name: K-BOOKS Checker
 
 on:
-  # 5分おきに自動実行 (UTC時間なので日本時間とはズレますが、定期的に回ります)
   schedule:
     - cron: '*/5 * * * *'
-  # スマホやPCのGitHub画面から「手動」でも実行できるようにするボタン
   workflow_dispatch:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # ← 変更：最新のOS環境に合わせる
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
