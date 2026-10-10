@@ -1,5 +1,10 @@
-import os
-import requests
+"""K-BOOKS の店舗データと、サイト・コマンドの解析ロジック（ネットワークに依存しない部分）"""
+from __future__ import annotations
+
+import re
+import unicodedata
+from dataclasses import dataclass
+
 from bs4 import BeautifulSoup
 
 # --- 全店舗のURLマッピング（番号監視用） ---
@@ -114,113 +119,87 @@ KAITORI_DATABASE = {
 
 DEFAULT_STORE = "キャラ館"
 
-BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
-CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID")
-WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
+STOP_WORDS = {"停止", "ストップ", "stop", "キャンセル", "cancel"}
+STATUS_WORDS = {"状況", "status", "確認"}
+HELP_WORDS = {"ヘルプ", "help", "使い方"}
 
-def send_discord_notification(message):
-    data = {"content": message}
-    try:
-        requests.post(WEBHOOK_URL, json=data, timeout=10)
-    except Exception as e:
-        print(f"Discord通知エラー: {e}")
 
-def get_latest_user_message():
-    """ボット以外のユーザーが送信した最新のメッセージを取得する"""
-    url = f"https://discord.com/api/v10/channels/{CHANNEL_ID}/messages?limit=10"
-    headers = {"Authorization": f"Bot {BOT_TOKEN}"}
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            messages = response.json()
-            for msg in messages:
-                # ボット自身のメッセージ（author.botがTrue）はスキップして、人間のメッセージを探す
-                if not msg.get("author", {}).get("bot", False):
-                    return msg["content"].strip()
-    except Exception as e:
-        print(f"Discordからのメッセージ取得エラー: {e}")
+def normalize(text: str) -> str:
+    """全角数字・全角スペースなどを半角にそろえる"""
+    return unicodedata.normalize("NFKC", text).strip()
+
+
+@dataclass
+class Command:
+    kind: str  # "watch" / "stop" / "status" / "help" / "search"
+    store: str | None = None
+    number: int | None = None
+    query: str | None = None
+
+
+def parse_command(content: str) -> Command:
+    text = normalize(content)
+    parts = text.split()
+    lower = text.lower()
+
+    if lower in STOP_WORDS:
+        return Command("stop")
+    if lower in STATUS_WORDS:
+        return Command("status")
+    if lower in HELP_WORDS:
+        return Command("help")
+
+    if text.isdigit():
+        return Command("watch", store=DEFAULT_STORE, number=int(text))
+    if len(parts) == 2 and parts[1].isdigit():
+        return Command("watch", store=parts[0], number=int(parts[1]))
+    # 「同人館123」のように空白なしでもOK
+    m = re.fullmatch(r"(\D+?)(\d+)", text)
+    if m and m.group(1) in STORE_URLS:
+        return Command("watch", store=m.group(1), number=int(m.group(2)))
+
+    return Command("search", query=text)
+
+
+def search_store(query: str) -> str | None:
+    q = normalize(query).lower()
+    for key, store in KAITORI_DATABASE.items():
+        if normalize(key).lower() in q:
+            return store
     return None
 
-def main():
-    content = get_latest_user_message()
-    if not content:
-        print("Discordから有効なユーザーメッセージを取得できませんでした。")
-        return
 
-    print(f"取得したユーザーメッセージ: {content}")
+@dataclass
+class CallStatus:
+    raw: str
+    number: int | None  # 現在の呼び出し番号（読めなかったら None）
+    preparing: bool
 
-    parts = content.split()
-    is_search = False
-    query = content
 
-    if len(parts) == 2 and parts[1].isdigit():
-        is_search = False
-    elif content.isdigit():
-        is_search = False
-    elif content in STORE_URLS:
-        is_search = False
-    else:
-        is_search = True
+def parse_call_page(html: str) -> CallStatus:
+    """呼び出し番号ページから現在の番号を読み取る"""
+    soup = BeautifulSoup(html, "html.parser")
+    area = soup.find("div", class_="contents-area")
+    raw = ""
+    if area:
+        p = area.find("p")
+        raw = (p or area).get_text(" ", strip=True)
+    raw = normalize(raw)
 
-    # --- 買取先検索モード ---
-    if is_search:
-        print(f"買取先検索モード: 「{query}」")
-        found_store = "該当する館が見つかりませんでした（名称を確認してください）"
-        
-        for key, store in KAITORI_DATABASE.items():
-            if key in query:
-                found_store = store
-                break
-        
-        msg = f"🔍 **【K-BOOKS売却先検索】**\n入力キーワード: **{query}**\nおすすめの売却先: **{found_store}**"
-        send_discord_notification(msg)
-        print("検索結果を通知しました。")
-        return
+    if "準備中" in raw:
+        return CallStatus(raw, None, True)
 
-    # --- 番号監視モード ---
-    if len(parts) >= 2 and parts[1].isdigit():
-        store_name = parts[0]
-        my_number = int(parts[1])
-    elif content.isdigit():
-        store_name = DEFAULT_STORE
-        my_number = int(content)
-    else:
-        print("有効なコマンドとして認識されませんでした。")
-        return
+    nums = re.findall(r"\d+", raw)
+    number = int(nums[0]) if nums else None
+    return CallStatus(raw, number, False)
 
-    target_url = STORE_URLS.get(store_name)
-    if not target_url:
-        print(f"未知の店舗名です: {store_name}")
-        return
 
-    print(f"監視対象 -> 店舗: {store_name} / 番号: {my_number}")
-
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    try:
-        response = requests.get(target_url, headers=headers, timeout=10)
-        response.encoding = response.apparent_encoding
-    except Exception as e:
-        print(f"ページ取得エラー: {e}")
-        return
-    
-    soup = BeautifulSoup(response.text, 'html.parser')
-    contents_area = soup.find('div', class_='contents-area')
-    current_status = contents_area.find('p').get_text(strip=True) if contents_area and contents_area.find('p') else ""
-
-    print(f"現在のサイト状況: {current_status}")
-
-    if "準備中" in current_status:
-        print("まだ呼び出しが始まっていません（準備中）。")
-        return
-
-    if current_status.isdigit():
-        current_num = int(current_status)
-        if current_num >= my_number:
-            msg = f"@here 🎯 【{store_name}】の順番が来ました！\n設定番号: **{my_number}** / 現在の呼び出し番号: **{current_num}**\n{target_url}"
-            send_discord_notification(msg)
-            print("通知を送信しました。")
-        else:
-            print(f"まだ {store_name} の自分の番号（{my_number}）には達していません（現在 {current_num} 番）。")
-
-if __name__ == "__main__":
-    main()
+def decode_html(body: bytes, charset: str | None) -> str:
+    for enc in [charset, "utf-8", "cp932", "euc_jp"]:
+        if not enc:
+            continue
+        try:
+            return body.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return body.decode("utf-8", errors="replace")
